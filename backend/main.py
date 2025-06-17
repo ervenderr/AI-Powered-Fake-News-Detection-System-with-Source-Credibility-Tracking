@@ -1,7 +1,16 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from .model_service import model_service
+from pydantic import BaseModel, HttpUrl
+from typing import Optional, List
+import sys
+import os
+from pathlib import Path
+
+# Add the project root to the path so we can import modules correctly
+sys.path.append(str(Path(__file__).parent.parent))
+
+from backend.model_service import model_service
+from backend.credibility_tracker import credibility_tracker
 import logging
 
 # Set up logging
@@ -30,6 +39,11 @@ app.add_middleware(
 class NewsItem(BaseModel):
     """Request model for news text to analyze"""
     text: str
+    url: Optional[HttpUrl] = None
+
+class SourceQuery(BaseModel):
+    """Request model for source credibility query"""
+    domain: str
 
 @app.get("/ping")
 async def health_check():
@@ -60,12 +74,78 @@ async def predict_fake_news(news_item: NewsItem):
     
     logger.info(f"Prediction result: {result['prediction']} (confidence: {result['confidence']:.4f})")
     
-    return {
+    response = {
         "prediction": result["prediction"],
         "confidence": result["confidence"],
         "fake_probability": result["fake_probability"],
         "real_probability": result["real_probability"]
     }
+    
+    # If URL is provided, extract metadata and update source credibility
+    if news_item.url:
+        try:
+            # Extract metadata
+            metadata = credibility_tracker.extract_metadata(str(news_item.url))
+            
+            # Record article and update source credibility
+            source_info = credibility_tracker.record_article(
+                str(news_item.url),
+                metadata,
+                result["prediction"],
+                result["confidence"]
+            )
+            
+            # Add source info to response
+            response["source_info"] = source_info
+            
+        except Exception as e:
+            logger.error(f"Error processing source credibility: {e}")
+            # Don't fail the request if credibility tracking fails
+    
+    return response
+
+@app.get("/source_score")
+async def get_source_score(domain: str = Query(..., description="Domain to get credibility score for")):
+    """
+    Get the credibility score for a news source domain
+    
+    Args:
+        domain: Domain to get credibility score for
+        
+    Returns:
+        dict: Source information including credibility score
+    """
+    if not domain:
+        raise HTTPException(status_code=400, detail="Domain parameter is required")
+    
+    logger.info(f"Received source score request for domain: {domain}")
+    
+    source_info = credibility_tracker.get_source_info(domain)
+    
+    return source_info
+
+@app.get("/sources")
+async def get_all_sources(
+    limit: int = Query(100, description="Maximum number of sources to return"),
+    sort_by: str = Query("credibility_score", description="Field to sort by"),
+    ascending: bool = Query(False, description="Whether to sort in ascending order")
+):
+    """
+    Get information about all tracked news sources
+    
+    Args:
+        limit: Maximum number of sources to return
+        sort_by: Field to sort by
+        ascending: Whether to sort in ascending order
+        
+    Returns:
+        list: List of source information dictionaries
+    """
+    logger.info(f"Received request for all sources (limit={limit}, sort_by={sort_by}, ascending={ascending})")
+    
+    sources = credibility_tracker.get_all_sources(limit=limit, sort_by=sort_by, ascending=ascending)
+    
+    return sources
 
 if __name__ == "__main__":
     import uvicorn
